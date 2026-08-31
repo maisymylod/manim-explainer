@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    name: Scenes import and render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libcairo2-dev libpango1.0-dev ffmpeg \
+            texlive texlive-latex-extra texlive-fonts-extra dvisvgm
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Every scene module imports
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+          import sys
+
+          sys.path.insert(0, ".")
+          import helpers  # noqa: F401
+
+          scenes = sorted(pathlib.Path("scenes").glob("*.py"))
+          assert scenes, "no scene files found"
+          for path in scenes:
+              spec = importlib.util.spec_from_file_location(path.stem, path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              print(f"imported {path}")
+          PY
+
+      - name: Render one frame per scene
+        # -s renders the final frame only, which exercises the whole scene
+        # construction (including LaTeX) without paying for a full video.
+        run: |
+          manim -ql -s scenes/hello.py HelloScene
+          manim -ql -s scenes/latex_check.py LatexCheck
+          manim -ql -s scenes/fourier_epicycles.py FourierEpicycles
+
+      - name: Every frame was actually written
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          expected = {
+              "HelloScene": "media/images/hello",
+              "LatexCheck": "media/images/latex_check",
+              "FourierEpicycles": "media/images/fourier_epicycles",
+          }
+          failures = []
+          for scene, directory in expected.items():
+              frames = list(pathlib.Path(directory).glob(f"{scene}*.png"))
+              if not frames:
+                  failures.append(f"{scene}: no frame written to {directory}")
+                  continue
+              size = frames[0].stat().st_size
+              # A blank or truncated PNG is a few hundred bytes; a real 854x480
+              # frame from these scenes is comfortably above 10 KB.
+              if size < 10_000:
+                  failures.append(f"{scene}: frame is only {size} bytes, likely blank")
+              else:
+                  print(f"{scene}: {frames[0].name} ({size} bytes)")
+          if failures:
+              sys.exit("\n".join(failures))
+          PY
+
+      - name: Upload the rendered frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-frames
+          path: media/images/**/*.png
